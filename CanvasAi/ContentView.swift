@@ -22,6 +22,9 @@ struct ContentView: View {
         ]),
     ]
     @State private var looseCards: [LooseCard] = []
+    @State private var canvasResult: CanvasResult? = nil
+    @State private var isAnalyzing: Bool = false
+    @State private var analysisError: String? = nil
 
     var body: some View {
         ZStack {
@@ -34,15 +37,31 @@ struct ContentView: View {
             WarpedGridView()
                 .ignoresSafeArea()
 
-            if images.isEmpty {
+            if images.isEmpty && !isAnalyzing && canvasResult == nil {
                 GlassCard()
             }
 
-            OutputCard()
-                .zIndex(1)
+            if let result = canvasResult {
+                OutputCard(result: result)
+                    .zIndex(1)
+            }
 
             GroupedCardsView(groups: $groups, looseCards: $looseCards)
                 .zIndex(2)
+
+            if isAnalyzing {
+                VStack(spacing: 12) {
+                    ProgressView()
+                        .scaleEffect(1.2)
+                    Text("Reading your images…")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+                .padding(24)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+                .zIndex(30)
+                .transition(.scale(scale: 0.9).combined(with: .opacity))
+            }
 
             // Floating prompt circle / bar — follows mouse, full screen overlay
             AnimatedPromptBar(isExpanded: $promptExpanded) { text, position in
@@ -62,6 +81,14 @@ struct ContentView: View {
         .onChange(of: selectedItems) {
             Task { await loadImages() }
         }
+        .alert("Analysis Error", isPresented: Binding(
+            get: { analysisError != nil },
+            set: { if !$0 { analysisError = nil } }
+        )) {
+            Button("OK") { analysisError = nil }
+        } message: {
+            Text(analysisError ?? "")
+        }
     }
 
     private func loadImages() async {
@@ -75,6 +102,52 @@ struct ContentView: View {
         withAnimation(.spring(response: 0.5, dampingFraction: 0.7)) {
             images = newImages
         }
+
+        guard !newImages.isEmpty else { return }
+        isAnalyzing = true
+        analysisError = nil
+
+        do {
+            let result = try await ClaudeService.shared.analyze(images: newImages)
+            withAnimation(.spring(response: 0.5, dampingFraction: 0.7)) {
+                canvasResult = result
+                groups = result.groups.map { g in
+                    let groupCards = result.cards.filter { $0.groupId == g.id }.map { c in
+                        CardData(id: c.id, title: c.label, icon: iconForCard(c.label))
+                    }
+                    return CardGroup(id: g.id, title: g.title, color: colorFromString(g.color), cards: groupCards)
+                }
+                looseCards = []
+            }
+        } catch {
+            analysisError = error.localizedDescription
+        }
+        isAnalyzing = false
+    }
+
+    private func colorFromString(_ s: String) -> Color {
+        switch s.lowercased() {
+        case "green": return Color(red: 76/255, green: 175/255, blue: 80/255)
+        case "orange": return Color(red: 222/255, green: 115/255, blue: 86/255)
+        case "blue": return Color(red: 66/255, green: 133/255, blue: 244/255)
+        case "purple": return Color(red: 156/255, green: 39/255, blue: 176/255)
+        default: return Color(red: 158/255, green: 158/255, blue: 158/255)
+        }
+    }
+
+    private func iconForCard(_ label: String) -> String {
+        let l = label.lowercased()
+        if l.contains("flight") || l.contains("plane") || l.contains("fly") { return "airplane" }
+        if l.contains("hotel") || l.contains("stay") || l.contains("room") { return "bed.double" }
+        if l.contains("food") || l.contains("eat") || l.contains("restaurant") || l.contains("ramen") || l.contains("sushi") { return "fork.knife" }
+        if l.contains("train") || l.contains("rail") || l.contains("metro") { return "tram" }
+        if l.contains("temple") || l.contains("shrine") || l.contains("castle") { return "building.columns" }
+        if l.contains("shop") || l.contains("market") || l.contains("buy") { return "bag" }
+        if l.contains("photo") || l.contains("camera") || l.contains("view") { return "camera" }
+        if l.contains("budget") || l.contains("cost") || l.contains("price") || l.contains("money") { return "yensign" }
+        if l.contains("map") || l.contains("walk") || l.contains("hike") { return "map" }
+        if l.contains("night") || l.contains("bar") || l.contains("drink") { return "wineglass" }
+        return randomIcons.randomElement() ?? "doc.text"
     }
 }
 
@@ -618,6 +691,7 @@ struct CardDetailView: View {
 // MARK: - Output Card
 
 struct OutputCard: View {
+    let result: CanvasResult
     private let cardWidth: CGFloat = 260
     private let cornerRadius: CGFloat = 16
     private let accentColor = Color(red: 222/255, green: 115/255, blue: 86/255)
@@ -626,7 +700,7 @@ struct OutputCard: View {
         VStack(alignment: .leading, spacing: 0) {
             // Header
             VStack(alignment: .leading, spacing: 6) {
-                Text("travel")
+                Text(result.mode)
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(.white)
                     .textCase(.uppercase)
@@ -638,7 +712,7 @@ struct OutputCard: View {
                             .fill(.white.opacity(0.2))
                     )
 
-                Text("Here's what I see in your photos")
+                Text(result.intent)
                     .font(.system(size: 12, weight: .regular))
                     .foregroundStyle(.white.opacity(0.7))
             }
@@ -652,20 +726,20 @@ struct OutputCard: View {
 
             // Body
             VStack(alignment: .leading, spacing: 14) {
-                Text("Weekend Getaway")
+                Text(result.title)
                     .font(.custom("DM Serif Display", size: 20))
                     .foregroundStyle(.white)
 
-                OutputSection(heading: "Places", items: ["Coastal cliffs at sunset", "Old town market square"])
-                OutputSection(heading: "Mood", items: ["Warm golden light", "Relaxed, candid moments"])
-                OutputSection(heading: "Story", items: ["A weekend road-trip south along the coast"])
+                ForEach(result.sections, id: \.heading) { section in
+                    OutputSection(heading: section.heading, items: section.items)
+                }
             }
             .padding(.horizontal, 20)
             .padding(.top, 14)
             .padding(.bottom, 16)
 
             // Footer
-            Text("Want me to turn this into a travel log?")
+            Text(result.question)
                 .font(.system(size: 12, weight: .regular))
                 .italic()
                 .foregroundStyle(.white)
