@@ -6,11 +6,30 @@ struct ContentView: View {
     @State private var images: [NSImage] = []
     @State private var promptExpanded: Bool = false
     @State private var showPhotoPicker: Bool = false
+    @State private var groups: [CardGroup] = [
+        CardGroup(id: "travel", title: "Travel", color: Color(red: 76/255, green: 175/255, blue: 80/255), cards: [
+            CardData(id: "tokyo", title: "Tokyo", icon: "building.2"),
+            CardData(id: "kyoto", title: "Kyoto", icon: "leaf"),
+            CardData(id: "osaka", title: "Osaka", icon: "fork.knife"),
+        ]),
+        CardGroup(id: "food", title: "Food", color: Color(red: 222/255, green: 115/255, blue: 86/255), cards: [
+            CardData(id: "ramen", title: "Ramen", icon: "cup.and.saucer"),
+            CardData(id: "sushi", title: "Sushi", icon: "fish"),
+        ]),
+        CardGroup(id: "budget", title: "Budget", color: Color(red: 66/255, green: 133/255, blue: 244/255), cards: [
+            CardData(id: "flights", title: "Flights", icon: "airplane"),
+            CardData(id: "hotels", title: "Hotels", icon: "bed.double"),
+        ]),
+    ]
+    @State private var looseCards: [LooseCard] = []
 
     var body: some View {
         ZStack {
             Color(red: 245 / 255, green: 242 / 255, blue: 236 / 255)
                 .ignoresSafeArea()
+                .onTapGesture(count: 2) {
+                    showPhotoPicker = true
+                }
 
             WarpedGridView()
                 .ignoresSafeArea()
@@ -22,21 +41,22 @@ struct ContentView: View {
             OutputCard()
                 .zIndex(1)
 
-            GroupedCardsView(groups: sampleGroups)
+            GroupedCardsView(groups: $groups, looseCards: $looseCards)
                 .zIndex(2)
 
-            // Double-click anywhere opens photo picker
-            Color.clear
-                .contentShape(Rectangle())
-                .onTapGesture(count: 2) {
-                    showPhotoPicker = true
-                }
-                .zIndex(3)
-                .allowsHitTesting(!promptExpanded)
-
             // Floating prompt circle / bar — follows mouse, full screen overlay
-            AnimatedPromptBar(isExpanded: $promptExpanded)
-                .zIndex(20)
+            AnimatedPromptBar(isExpanded: $promptExpanded) { text, position in
+                let newCard = LooseCard(
+                    id: UUID().uuidString,
+                    title: text,
+                    icon: randomIcons.randomElement() ?? "doc.text",
+                    position: position
+                )
+                withAnimation(.spring(response: 0.4, dampingFraction: 0.7)) {
+                    looseCards.append(newCard)
+                }
+            }
+            .zIndex(20)
         }
         .photosPicker(isPresented: $showPhotoPicker, selection: $selectedItems, matching: .images)
         .onChange(of: selectedItems) {
@@ -138,35 +158,34 @@ struct CardGroup: Identifiable {
     let id: String
     let title: String
     let color: Color
-    let cards: [CardData]
+    var cards: [CardData]
 }
 
-let sampleGroups: [CardGroup] = [
-    CardGroup(id: "travel", title: "Travel", color: Color(red: 76/255, green: 175/255, blue: 80/255), cards: [
-        CardData(id: "tokyo", title: "Tokyo", icon: "building.2"),
-        CardData(id: "kyoto", title: "Kyoto", icon: "leaf"),
-        CardData(id: "osaka", title: "Osaka", icon: "fork.knife"),
-    ]),
-    CardGroup(id: "food", title: "Food", color: Color(red: 222/255, green: 115/255, blue: 86/255), cards: [
-        CardData(id: "ramen", title: "Ramen", icon: "cup.and.saucer"),
-        CardData(id: "sushi", title: "Sushi", icon: "fish"),
-    ]),
-    CardGroup(id: "budget", title: "Budget", color: Color(red: 66/255, green: 133/255, blue: 244/255), cards: [
-        CardData(id: "flights", title: "Flights", icon: "airplane"),
-        CardData(id: "hotels", title: "Hotels", icon: "bed.double"),
-    ]),
+struct LooseCard: Identifiable {
+    let id: String
+    let title: String
+    let icon: String
+    var position: CGPoint
+}
+
+private let randomIcons = [
+    "doc.text", "lightbulb", "star", "bookmark", "tag",
+    "heart", "bolt", "flame", "globe", "music.note",
+    "camera", "pencil", "paperplane", "gift", "chart.bar"
 ]
 
 // MARK: - Grouped Cards View
 
 struct GroupedCardsView: View {
-    let groups: [CardGroup]
+    @Binding var groups: [CardGroup]
+    @Binding var looseCards: [LooseCard]
     private let clusterRadius: CGFloat = 80
     private let groupSpreadRadius: CGFloat = 260
 
     @State private var selectedCardId: String? = nil
     @State private var savedOffsets: [String: CGSize] = [:]
     @State private var activeDrag: [String: CGSize] = [:]
+    @State private var looseCardDrags: [String: CGSize] = [:]
     @State private var detailCard: CardData? = nil
     @State private var detailGroup: CardGroup? = nil
     @State private var glowingGroupId: String? = nil
@@ -201,6 +220,46 @@ struct GroupedCardsView: View {
                        y: base.y + saved.height + drag.height)
     }
 
+    private func groupCircleInfo(groupIndex gi: Int, cx: CGFloat, cy: CGFloat) -> (center: CGPoint, radius: CGFloat)? {
+        let group = groups[gi]
+        let n = group.cards.count
+        guard n > 0 else { return nil }
+        var positions: [CGPoint] = []
+        for ci in 0..<n {
+            positions.append(cardPosition(groupIndex: gi, cardIndex: ci, cx: cx, cy: cy))
+        }
+        let avgX = positions.map(\.x).reduce(0, +) / CGFloat(n)
+        let avgY = positions.map(\.y).reduce(0, +) / CGFloat(n)
+        let maxDist = positions.map { hypot($0.x - avgX, $0.y - avgY) }.max() ?? 0
+        return (CGPoint(x: avgX, y: avgY), maxDist + 70)
+    }
+
+    private func groupContaining(point: CGPoint, cx: CGFloat, cy: CGFloat) -> Int? {
+        for gi in 0..<groups.count {
+            if let info = groupCircleInfo(groupIndex: gi, cx: cx, cy: cy) {
+                if hypot(point.x - info.center.x, point.y - info.center.y) <= info.radius {
+                    return gi
+                }
+            }
+        }
+        return nil
+    }
+
+    private func addLooseCardToGroup(looseCard: LooseCard, groupIndex gi: Int) {
+        let newCard = CardData(id: looseCard.id, title: looseCard.title, icon: looseCard.icon)
+        withAnimation(.spring(response: 0.5, dampingFraction: 0.7)) {
+            groups[gi].cards.append(newCard)
+            looseCards.removeAll { $0.id == looseCard.id }
+            looseCardDrags.removeValue(forKey: looseCard.id)
+        }
+        glowingGroupId = groups[gi].id
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            withAnimation(.easeOut(duration: 0.5)) {
+                glowingGroupId = nil
+            }
+        }
+    }
+
     var body: some View {
         GeometryReader { geo in
             let cx = geo.size.width / 2
@@ -219,13 +278,9 @@ struct GroupedCardsView: View {
                         }
 
                         // Group encompassing circle
-                        if !positions.isEmpty {
-                            let avgX = positions.map(\.x).reduce(0, +) / CGFloat(n)
-                            let avgY = positions.map(\.y).reduce(0, +) / CGFloat(n)
-                            let maxDist = positions.map { hypot($0.x - avgX, $0.y - avgY) }.max() ?? 0
-                            let circleR = maxDist + 70
-
-                            let circleRect = CGRect(x: avgX - circleR, y: avgY - circleR, width: circleR * 2, height: circleR * 2)
+                        if let info = groupCircleInfo(groupIndex: gi, cx: cx, cy: cy) {
+                            let circleR = info.radius
+                            let circleRect = CGRect(x: info.center.x - circleR, y: info.center.y - circleR, width: circleR * 2, height: circleR * 2)
                             let circlePath = Path(ellipseIn: circleRect)
 
                             let isGlowing = glowingGroupId == group.id
@@ -302,22 +357,76 @@ struct GroupedCardsView: View {
                                         }
                                     }
                             )
-                            .onTapGesture {
-                                withAnimation(.spring(response: 0.35)) {
-                                    selectedCardId = card.id
-                                    detailCard = card
-                                    detailGroup = group
-                                    glowingGroupId = group.id
+                            .simultaneousGesture(
+                                TapGesture()
+                                    .onEnded {
+                                        withAnimation(.spring(response: 0.35)) {
+                                            selectedCardId = card.id
+                                            detailCard = card
+                                            detailGroup = group
+                                            glowingGroupId = group.id
+                                        }
+                                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                            withAnimation(.easeOut(duration: 0.6)) {
+                                                glowingGroupId = nil
+                                            }
+                                        }
+                                    }
+                            )
+                            .animation(.spring(response: 0.35), value: selectedCardId)
+                    }
+                }
+
+                // Loose (ungrouped) cards
+                ForEach(looseCards) { looseCard in
+                    let drag = looseCardDrags[looseCard.id] ?? .zero
+                    let currentPos = CGPoint(
+                        x: looseCard.position.x + drag.width,
+                        y: looseCard.position.y + drag.height
+                    )
+
+                    LooseCardView(title: looseCard.title, icon: looseCard.icon)
+                        .position(currentPos)
+                        .zIndex(5)
+                        .transition(.scale(scale: 0.3).combined(with: .opacity))
+                        .gesture(
+                            DragGesture()
+                                .onChanged { value in
+                                    looseCardDrags[looseCard.id] = value.translation
+                                    let hoverPoint = CGPoint(
+                                        x: looseCard.position.x + value.translation.width,
+                                        y: looseCard.position.y + value.translation.height
+                                    )
+                                    if let gi = groupContaining(point: hoverPoint, cx: cx, cy: cy) {
+                                        withAnimation(.easeInOut(duration: 0.2)) {
+                                            glowingGroupId = groups[gi].id
+                                        }
+                                    } else {
+                                        withAnimation(.easeInOut(duration: 0.2)) {
+                                            glowingGroupId = nil
+                                        }
+                                    }
                                 }
-                                // Fade glow after a moment
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                                    withAnimation(.easeOut(duration: 0.6)) {
+                                .onEnded { value in
+                                    let dropPoint = CGPoint(
+                                        x: looseCard.position.x + value.translation.width,
+                                        y: looseCard.position.y + value.translation.height
+                                    )
+                                    looseCardDrags[looseCard.id] = .zero
+
+                                    if let gi = groupContaining(point: dropPoint, cx: cx, cy: cy) {
+                                        addLooseCardToGroup(looseCard: looseCard, groupIndex: gi)
+                                    } else {
+                                        if let idx = looseCards.firstIndex(where: { $0.id == looseCard.id }) {
+                                            looseCards[idx].position = dropPoint
+                                        }
+                                    }
+
+                                    withAnimation(.easeOut(duration: 0.3)) {
                                         glowingGroupId = nil
                                     }
                                 }
-                            }
-                            .animation(.spring(response: 0.35), value: selectedCardId)
-                    }
+                        )
                 }
 
                 // Card Detail Overlay
@@ -378,6 +487,46 @@ struct GroupCard: View {
     }
 }
 
+// MARK: - Loose Card View
+
+struct LooseCardView: View {
+    let title: String
+    let icon: String
+    private let looseColor = Color(red: 150/255, green: 150/255, blue: 150/255)
+
+    var body: some View {
+        VStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.system(size: 22, weight: .medium))
+                .foregroundStyle(looseColor)
+                .frame(width: 44, height: 44)
+                .background(
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(looseColor.opacity(0.1))
+                )
+
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.primary.opacity(0.8))
+                .lineLimit(2)
+                .multilineTextAlignment(.center)
+        }
+        .frame(width: 90, height: 90)
+        .background(
+            RoundedRectangle(cornerRadius: 14)
+                .fill(.white)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14)
+                        .strokeBorder(
+                            style: StrokeStyle(lineWidth: 1.5, dash: [5, 3])
+                        )
+                        .foregroundStyle(looseColor.opacity(0.4))
+                )
+                .shadow(color: .black.opacity(0.08), radius: 8, y: 3)
+        )
+    }
+}
+
 // MARK: - Card Detail View
 
 struct CardDetailView: View {
@@ -416,7 +565,6 @@ struct CardDetailView: View {
             Text(card.title)
                 .font(.system(size: 24, weight: .regular, design: .serif))
                 .foregroundStyle(.primary)
-
             Spacer().frame(height: 14)
 
             // Body placeholder
@@ -582,6 +730,7 @@ struct OutputSection: View {
 
 struct AnimatedPromptBar: View {
     @Binding var isExpanded: Bool
+    var onSubmit: (String, CGPoint) -> Void
     @State private var phase: PromptPhase = .circle
     @State private var mousePos: CGPoint = .zero
     @State private var anchorPos: CGPoint = .zero  // where the bar opens
@@ -608,67 +757,68 @@ struct AnimatedPromptBar: View {
             let posX: CGFloat = phase == .circle ? mousePos.x : anchorPos.x + rollOffset
             let posY: CGFloat = phase == .circle ? mousePos.y : anchorPos.y
 
-            ZStack {
-                HStack(spacing: 0) {
-                    if phase == .expanded {
-                        HStack(spacing: 10) {
-                            Image(systemName: "sparkles")
-                                .font(.system(size: 14, weight: .medium))
-                                .foregroundStyle(.white.opacity(0.6))
+            HStack(spacing: 0) {
+                if phase == .expanded {
+                    HStack(spacing: 10) {
+                        Image(systemName: "sparkles")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.6))
 
-                            TextField("Ask CanvasAi anything…", text: $promptText)
-                                .textFieldStyle(.plain)
-                                .font(.system(size: 14))
-                                .foregroundStyle(.white)
-                                .focused($isFocused)
+                        TextField("Ask CanvasAi anything…", text: $promptText)
+                            .textFieldStyle(.plain)
+                            .font(.system(size: 14))
+                            .foregroundStyle(.white)
+                            .focused($isFocused)
+                            .onSubmit { submitPrompt() }
 
+                        Button { submitPrompt() } label: {
                             Image(systemName: "arrow.up.circle.fill")
                                 .font(.system(size: 22))
-                                .foregroundStyle(.white.opacity(0.8))
+                                .foregroundStyle(.white.opacity(
+                                    promptText.trimmingCharacters(in: .whitespaces).isEmpty ? 0.4 : 0.8
+                                ))
                         }
-                        .padding(.horizontal, 16)
-                        .transition(.opacity.animation(.easeIn(duration: 0.2)))
+                        .buttonStyle(.plain)
+                        .disabled(promptText.trimmingCharacters(in: .whitespaces).isEmpty)
                     }
-                }
-                .frame(width: barWidth, height: circleSize)
-                .background(
-                    Capsule()
-                        .fill(accentColor)
-                        .shadow(color: accentColor.opacity(0.3), radius: 12, y: 4)
-                )
-                .clipShape(Capsule())
-                .rotationEffect(.degrees(rollRotation))
-                .position(x: posX, y: posY)
-                .animation(phase == .circle ? .smooth(duration: 0.15) : nil, value: mousePos)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .contentShape(Rectangle())
-            .onContinuousHover { hoverPhase in
-                if phase == .circle {
-                    switch hoverPhase {
-                    case .active(let location):
-                        mousePos = location
-                    case .ended:
-                        break
-                    }
+                    .padding(.horizontal, 16)
+                    .transition(.opacity.animation(.easeIn(duration: 0.2)))
                 }
             }
-            .contextMenu {
-                if phase == .expanded || phase == .expanding {
-                    Button("Close prompt") {
+            .frame(width: barWidth, height: circleSize)
+            .background(
+                Capsule()
+                    .fill(accentColor)
+                    .shadow(color: accentColor.opacity(0.3), radius: 12, y: 4)
+            )
+            .clipShape(Capsule())
+            .rotationEffect(.degrees(rollRotation))
+            .position(x: posX, y: posY)
+            .animation(phase == .circle ? .smooth(duration: 0.15) : nil, value: mousePos)
+        }
+        .allowsHitTesting(phase == .expanded)
+        .background(
+            MouseTrackingView(
+                onMouseMove: { point in
+                    if phase == .circle { mousePos = point }
+                },
+                onRightClick: {
+                    if phase == .circle {
+                        expandAnimation()
+                    } else if phase == .expanded || phase == .expanding {
                         collapseAnimation()
                     }
                 }
-            }
-            .gesture(
-                TapGesture(count: 1)
-                    .onEnded {
-                        if phase == .circle {
-                            expandAnimation()
-                        }
-                    }
             )
-        }
+        )
+    }
+
+    private func submitPrompt() {
+        let trimmed = promptText.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        let spawnPosition = CGPoint(x: anchorPos.x + rollOffset, y: anchorPos.y - 80)
+        onSubmit(trimmed, spawnPosition)
+        collapseAnimation()
     }
 
     private func expandAnimation() {
@@ -759,6 +909,64 @@ struct GlassCard: View {
         }
         //.shadow(color: accentColor.opacity(0.35), radius: 16, y: 8)
         .transition(.scale.combined(with: .opacity))
+    }
+}
+
+// MARK: - Mouse Tracking View
+
+struct MouseTrackingView: NSViewRepresentable {
+    let onMouseMove: (CGPoint) -> Void
+    let onRightClick: () -> Void
+
+    func makeNSView(context: Context) -> TrackingNSView {
+        let view = TrackingNSView()
+        view.onMouseMove = onMouseMove
+        view.onRightClick = onRightClick
+        view.setupMonitor()
+        return view
+    }
+
+    func updateNSView(_ nsView: TrackingNSView, context: Context) {
+        nsView.onMouseMove = onMouseMove
+        nsView.onRightClick = onRightClick
+    }
+
+    class TrackingNSView: NSView {
+        var onMouseMove: ((CGPoint) -> Void)?
+        var onRightClick: (() -> Void)?
+        private var monitor: Any?
+
+        func setupMonitor() {
+            guard monitor == nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) { [weak self] event in
+                self?.onRightClick?()
+                return nil
+            }
+        }
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            trackingAreas.forEach { removeTrackingArea($0) }
+            let area = NSTrackingArea(
+                rect: bounds,
+                options: [.mouseMoved, .activeInActiveApp, .inVisibleRect],
+                owner: self
+            )
+            addTrackingArea(area)
+        }
+
+        override func mouseMoved(with event: NSEvent) {
+            let loc = convert(event.locationInWindow, from: nil)
+            let flipped = CGPoint(x: loc.x, y: bounds.height - loc.y)
+            onMouseMove?(flipped)
+        }
+
+        deinit {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+        }
+
+        // Transparent to hit-testing so clicks/drags pass through
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
     }
 }
 
