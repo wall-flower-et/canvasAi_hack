@@ -4,6 +4,7 @@ import PhotosUI
 struct ContentView: View {
     @State private var selectedItems: [PhotosPickerItem] = []
     @State private var images: [NSImage] = []
+    @State private var promptExpanded: Bool = false
 
     var body: some View {
         ZStack {
@@ -17,25 +18,35 @@ struct ContentView: View {
                 GlassCard()
             }
 
-            ImageCards(images: images)
-
             if images.count >= 2 {
                 OutputCard()
-                    .zIndex(5)
+                    .zIndex(1)
             }
 
+            ImageCards(images: images)
+                .zIndex(2)
+                .allowsHitTesting(images.count > 0)
+
             // Add button — bottom center
-            VStack {
-                Spacer()
-                PhotosPicker(selection: $selectedItems, matching: .images) {
-                    Image(systemName: "plus.circle.fill")
-                        .font(.system(size: 36))
-                        .foregroundStyle(Color(red: 222/255, green: 115/255, blue: 86/255))
-                        .shadow(color: .black.opacity(0.1), radius: 4, y: 2)
+            if !promptExpanded {
+                VStack {
+                    Spacer()
+                    PhotosPicker(selection: $selectedItems, matching: .images) {
+                        Image(systemName: "plus.circle.fill")
+                            .font(.system(size: 36))
+                            .foregroundStyle(Color(red: 222/255, green: 115/255, blue: 86/255))
+                            .shadow(color: .black.opacity(0.1), radius: 4, y: 2)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.bottom, 30)
                 }
-                .buttonStyle(.plain)
-                .padding(.bottom, 30)
+                .zIndex(10)
+                .transition(.scale.combined(with: .opacity))
             }
+
+            // Floating prompt circle / bar — follows mouse, full screen overlay
+            AnimatedPromptBar(isExpanded: $promptExpanded)
+                .zIndex(20)
         }
         .onChange(of: selectedItems) {
             Task { await loadImages() }
@@ -137,11 +148,16 @@ struct ConnectionLine {
 
 struct ImageCards: View {
     let images: [NSImage]
-    private let radius: CGFloat = 260
+    private let spreadRadius: CGFloat = 280
     private let accentColor = Color(red: 222/255, green: 115/255, blue: 86/255)
 
+    // Orbit center offset from screen center
+    private let orbitOffsetX: CGFloat = -80
+    private let orbitOffsetY: CGFloat = -30
+
     @State private var selectedId: Int? = nil
-    @State private var dragOffsets: [Int: CGSize] = [:]
+    @State private var savedOffsets: [Int: CGSize] = [:]   // persisted position
+    @State private var activeDrag: [Int: CGSize] = [:]     // live drag delta
 
     // Auto-generate connections: consecutive + one cross
     private var connections: [ConnectionLine] {
@@ -157,12 +173,31 @@ struct ImageCards: View {
         return lines
     }
 
+    // Fibonacci sphere → 2D projection
+    // Golden angle distributes N points evenly on a sphere,
+    // then we project (x, y) to get a naturally-spaced 2D layout
     private func cardPosition(_ i: Int, cx: CGFloat, cy: CGFloat) -> CGPoint {
         let n = images.count
-        let angle = n == 1 ? 0 : (CGFloat.pi * 2 / CGFloat(n)) * CGFloat(i) - .pi / 2
-        let offset = dragOffsets[i] ?? .zero
-        return CGPoint(x: cx + cos(angle) * radius + offset.width,
-                       y: cy + sin(angle) * radius + offset.height)
+        let goldenAngle = CGFloat.pi * (3.0 - sqrt(5.0)) // ~2.3999 rad
+        let ringCx = cx + orbitOffsetX
+        let ringCy = cy + orbitOffsetY
+
+        // Fibonacci sphere: y goes from -1 to 1, golden angle increments azimuth
+        let t = n <= 1 ? 0.0 : CGFloat(i) / CGFloat(n - 1)
+        let phi = CGFloat(i) * goldenAngle
+        let cosTheta = 1.0 - 2.0 * t          // ranges from 1 to -1
+        let sinTheta = sqrt(1.0 - cosTheta * cosTheta)
+
+        // Project sphere (x, y) → screen (x, y), z becomes depth/scale
+        let sx = sinTheta * cos(phi)
+        let sy = sinTheta * sin(phi)
+
+        let saved = savedOffsets[i] ?? .zero
+        let drag = activeDrag[i] ?? .zero
+        return CGPoint(
+            x: ringCx + sx * spreadRadius + saved.width + drag.width,
+            y: ringCy + sy * spreadRadius + saved.height + drag.height
+        )
     }
 
     var body: some View {
@@ -202,10 +237,9 @@ struct ImageCards: View {
                     let pos = cardPosition(i, cx: cx, cy: cy)
                     let isSelected = selectedId == i
                     let hasFocus = selectedId != nil
-                    let offset = dragOffsets[i] ?? .zero
 
                     ImageCard(image: images[i])
-                        .scaleEffect(isSelected ? 1.3 : (hasFocus ? 0.9 : 1.0))
+                        .scaleEffect(isSelected ? 1.15 : (hasFocus ? 0.9 : 1.0))
                         .opacity(isSelected ? 1.0 : (hasFocus ? 0.3 : 1.0))
                         .shadow(color: isSelected ? .black.opacity(0.2) : .clear, radius: 20, y: 10)
                         .zIndex(isSelected ? 10 : 0)
@@ -215,14 +249,18 @@ struct ImageCards: View {
                             DragGesture()
                                 .onChanged { value in
                                     selectedId = i
-                                    dragOffsets[i] = value.translation
+                                    activeDrag[i] = value.translation
                                 }
-                                .onEnded { _ in
-                                    withAnimation(.spring(response: 0.4, dampingFraction: 0.7)) {
-                                        dragOffsets[i] = .zero
-                                    }
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                                        if selectedId == i { selectedId = nil }
+                                .onEnded { value in
+                                    // Accumulate into saved offset
+                                    let prev = savedOffsets[i] ?? .zero
+                                    savedOffsets[i] = CGSize(
+                                        width: prev.width + value.translation.width,
+                                        height: prev.height + value.translation.height
+                                    )
+                                    activeDrag[i] = .zero
+                                    withAnimation(.spring(response: 0.3)) {
+                                        selectedId = nil
                                     }
                                 }
                         )
@@ -369,6 +407,152 @@ struct OutputSection: View {
                         .foregroundStyle(.white.opacity(0.9))
                 }
             }
+        }
+    }
+}
+
+// MARK: - Animated Prompt Bar
+
+struct AnimatedPromptBar: View {
+    @Binding var isExpanded: Bool
+    @State private var phase: PromptPhase = .circle
+    @State private var mousePos: CGPoint = .zero
+    @State private var rollOffset: CGFloat = 0
+    @State private var rollRotation: Double = 0
+    @State private var barWidth: CGFloat = 44
+    @State private var promptText: String = ""
+    @FocusState private var isFocused: Bool
+
+    private let circleSize: CGFloat = 44
+    private let expandedWidth: CGFloat = 400
+    private let accentColor = Color(red: 222/255, green: 115/255, blue: 86/255)
+
+    enum PromptPhase {
+        case circle
+        case rolling
+        case expanding
+        case expanded
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            let screenCx = geo.size.width / 2
+            let anchorY = geo.size.height - 50
+
+            // Where the shape should be
+            let posX: CGFloat = phase == .circle ? mousePos.x : screenCx + rollOffset
+            let posY: CGFloat = phase == .circle ? mousePos.y : anchorY
+
+            ZStack {
+                HStack(spacing: 0) {
+                    if phase == .expanded {
+                        HStack(spacing: 10) {
+                            Image(systemName: "sparkles")
+                                .font(.system(size: 14, weight: .medium))
+                                .foregroundStyle(.white.opacity(0.6))
+
+                            TextField("Ask CanvasAi anything…", text: $promptText)
+                                .textFieldStyle(.plain)
+                                .font(.system(size: 14))
+                                .foregroundStyle(.white)
+                                .focused($isFocused)
+
+                            Image(systemName: "arrow.up.circle.fill")
+                                .font(.system(size: 22))
+                                .foregroundStyle(.white.opacity(0.8))
+                        }
+                        .padding(.horizontal, 16)
+                        .transition(.opacity.animation(.easeIn(duration: 0.2)))
+                    }
+                }
+                .frame(width: barWidth, height: circleSize)
+                .background(
+                    Capsule()
+                        .fill(accentColor)
+                        .shadow(color: accentColor.opacity(0.3), radius: 12, y: 4)
+                )
+                .clipShape(Capsule())
+                .rotationEffect(.degrees(rollRotation))
+                .position(x: posX, y: posY)
+                .animation(phase == .circle ? .smooth(duration: 0.15) : nil, value: mousePos)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .contentShape(Rectangle())
+            .onContinuousHover { hoverPhase in
+                if phase == .circle {
+                    switch hoverPhase {
+                    case .active(let location):
+                        mousePos = location
+                    case .ended:
+                        break
+                    }
+                }
+            }
+            .onTapGesture(count: 2) {
+                if phase == .expanded || phase == .expanding {
+                    collapseAnimation(screenCx: screenCx, anchorY: anchorY)
+                }
+            }
+            .onTapGesture(count: 1) {
+                if phase == .circle {
+                    expandAnimation(screenCx: screenCx, anchorY: anchorY)
+                }
+            }
+        }
+    }
+
+    private func expandAnimation(screenCx: CGFloat, anchorY: CGFloat) {
+        // Snap to bottom center to start rolling
+        withAnimation(.easeOut(duration: 0.25)) {
+            mousePos = CGPoint(x: screenCx - 160, y: anchorY)
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            isExpanded = true
+            phase = .rolling
+
+            // Phase 1: Roll to the right
+            withAnimation(.easeIn(duration: 0.45)) {
+                rollOffset = 160
+                rollRotation = 360
+            }
+
+            // Phase 2: Stop rolling, expand width
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+                phase = .expanding
+                rollRotation = 0
+                withAnimation(.spring(response: 0.4, dampingFraction: 0.75)) {
+                    rollOffset = 0
+                    barWidth = expandedWidth
+                }
+            }
+
+            // Phase 3: Show text field
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.85) {
+                phase = .expanded
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    isFocused = true
+                }
+            }
+        }
+    }
+
+    private func collapseAnimation(screenCx: CGFloat, anchorY: CGFloat) {
+        isFocused = false
+        promptText = ""
+
+        // Shrink bar back to circle
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+            barWidth = circleSize
+            phase = .circle
+            isExpanded = false
+        }
+
+        // Reset position to center so it picks up mouse again
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            rollOffset = 0
+            rollRotation = 0
+            mousePos = CGPoint(x: screenCx, y: anchorY)
         }
     }
 }
