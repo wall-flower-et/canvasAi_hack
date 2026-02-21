@@ -3,7 +3,15 @@ import AppKit
 
 // MARK: - Response Models
 
-private let apiKey = ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"] ?? ""
+private let apiKey: String = {
+    if let url = Bundle.main.url(forResource: "Secrets", withExtension: "plist"),
+       let data = try? Data(contentsOf: url),
+       let dict = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: String],
+       let key = dict["ANTHROPIC_API_KEY"], !key.isEmpty {
+        return key
+    }
+    return ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"] ?? ""
+}()
 
 struct CanvasResult: Codable {
     let mode: String

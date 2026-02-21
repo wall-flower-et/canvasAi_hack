@@ -1,30 +1,18 @@
 import SwiftUI
 import PhotosUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @State private var selectedItems: [PhotosPickerItem] = []
     @State private var images: [NSImage] = []
     @State private var promptExpanded: Bool = false
     @State private var showPhotoPicker: Bool = false
-    @State private var groups: [CardGroup] = [
-        CardGroup(id: "travel", title: "Travel", color: Color(red: 76/255, green: 175/255, blue: 80/255), cards: [
-            CardData(id: "tokyo", title: "Tokyo", icon: "building.2"),
-            CardData(id: "kyoto", title: "Kyoto", icon: "leaf"),
-            CardData(id: "osaka", title: "Osaka", icon: "fork.knife"),
-        ]),
-        CardGroup(id: "food", title: "Food", color: Color(red: 222/255, green: 115/255, blue: 86/255), cards: [
-            CardData(id: "ramen", title: "Ramen", icon: "cup.and.saucer"),
-            CardData(id: "sushi", title: "Sushi", icon: "fish"),
-        ]),
-        CardGroup(id: "budget", title: "Budget", color: Color(red: 66/255, green: 133/255, blue: 244/255), cards: [
-            CardData(id: "flights", title: "Flights", icon: "airplane"),
-            CardData(id: "hotels", title: "Hotels", icon: "bed.double"),
-        ]),
-    ]
+    @State private var groups: [CardGroup] = []
     @State private var looseCards: [LooseCard] = []
     @State private var canvasResult: CanvasResult? = nil
     @State private var isAnalyzing: Bool = false
     @State private var analysisError: String? = nil
+    @State private var canvasPhase: CanvasPhase = .empty
 
     var body: some View {
         ZStack {
@@ -37,8 +25,8 @@ struct ContentView: View {
             WarpedGridView()
                 .ignoresSafeArea()
 
-            if images.isEmpty && !isAnalyzing && canvasResult == nil {
-                GlassCard()
+            if canvasPhase == .empty {
+                GlassCard { showPhotoPicker = true }
             }
 
             if let result = canvasResult {
@@ -59,6 +47,8 @@ struct ContentView: View {
                 }
                 .padding(24)
                 .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+                .frame(maxHeight: .infinity, alignment: .bottom)
+                .padding(.bottom, 60)
                 .zIndex(30)
                 .transition(.scale(scale: 0.9).combined(with: .opacity))
             }
@@ -76,6 +66,30 @@ struct ContentView: View {
                 }
             }
             .zIndex(20)
+
+            // Floating + button (top-right, always visible after first load)
+            if canvasPhase != .empty {
+                Button { showPhotoPicker = true } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 36, height: 36)
+                        .background(
+                            Circle()
+                                .fill(Color(red: 222/255, green: 115/255, blue: 86/255))
+                                .shadow(color: .black.opacity(0.15), radius: 8, y: 4)
+                        )
+                }
+                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                .padding(.top, 20)
+                .padding(.trailing, 20)
+                .zIndex(25)
+            }
+        }
+        .onDrop(of: [UTType.image], isTargeted: nil) { providers in
+            handleDrop(providers: providers)
+            return true
         }
         .photosPicker(isPresented: $showPhotoPicker, selection: $selectedItems, matching: .images)
         .onChange(of: selectedItems) {
@@ -91,6 +105,87 @@ struct ContentView: View {
         }
     }
 
+    private func handleDrop(providers: [NSItemProvider]) {
+        var droppedImages: [NSImage] = []
+        let group = DispatchGroup()
+
+        for provider in providers {
+            if provider.canLoadObject(ofClass: NSImage.self) {
+                group.enter()
+                provider.loadObject(ofClass: NSImage.self) { object, _ in
+                    if let image = object as? NSImage {
+                        droppedImages.append(image)
+                    }
+                    group.leave()
+                }
+            }
+        }
+
+        group.notify(queue: .main) {
+            guard !droppedImages.isEmpty else { return }
+            Task { await processDroppedImages(droppedImages) }
+        }
+    }
+
+    private func processDroppedImages(_ droppedImages: [NSImage]) async {
+        var thumbnails: [String: NSImage] = [:]
+        var scattered: [LooseCard] = []
+
+        for (index, image) in droppedImages.enumerated() {
+            let cardId = "c\(index)"
+            let thumb = generateThumbnail(from: image)
+            thumbnails[cardId] = thumb
+
+            let angle = (2 * Double.pi / Double(droppedImages.count)) * Double(index)
+                        + Double.random(in: -0.3...0.3)
+            let radius = Double.random(in: 80...180)
+            let cx = 640.0 + cos(angle) * radius
+            let cy = 400.0 + sin(angle) * radius
+
+            scattered.append(LooseCard(
+                id: cardId,
+                title: "Image \(index)",
+                icon: "photo",
+                position: CGPoint(x: cx, y: cy),
+                thumbnail: thumb
+            ))
+        }
+
+        withAnimation(.spring(response: 0.6, dampingFraction: 0.7)) {
+            images = droppedImages
+            looseCards = scattered
+            groups = []
+            canvasResult = nil
+            canvasPhase = .scattered
+        }
+
+        isAnalyzing = true
+        analysisError = nil
+
+        do {
+            let result = try await ClaudeService.shared.analyze(images: droppedImages)
+            withAnimation(.spring(response: 0.8, dampingFraction: 0.65)) {
+                canvasResult = result
+                canvasPhase = .organized
+                groups = result.groups.map { g in
+                    let groupCards = result.cards.filter { $0.groupId == g.id }.map { c in
+                        CardData(
+                            id: c.id,
+                            title: c.label,
+                            icon: iconForCard(c.label),
+                            thumbnail: thumbnails[c.id]
+                        )
+                    }
+                    return CardGroup(id: g.id, title: g.title, color: colorFromString(g.color), cards: groupCards)
+                }
+                looseCards = []
+            }
+        } catch {
+            analysisError = error.localizedDescription
+        }
+        isAnalyzing = false
+    }
+
     private func loadImages() async {
         var newImages: [NSImage] = []
         for item in selectedItems {
@@ -99,21 +194,60 @@ struct ContentView: View {
                 newImages.append(nsImage)
             }
         }
-        withAnimation(.spring(response: 0.5, dampingFraction: 0.7)) {
-            images = newImages
-        }
 
         guard !newImages.isEmpty else { return }
+
+        // Phase 1: Generate thumbnails and scatter as loose cards
+        var thumbnails: [String: NSImage] = [:]
+        var scattered: [LooseCard] = []
+
+        for (index, image) in newImages.enumerated() {
+            let cardId = "c\(index)"
+            let thumb = generateThumbnail(from: image)
+            thumbnails[cardId] = thumb
+
+            let angle = (2 * Double.pi / Double(newImages.count)) * Double(index)
+                        + Double.random(in: -0.3...0.3)
+            let radius = Double.random(in: 80...180)
+            let cx = 640.0 + cos(angle) * radius
+            let cy = 400.0 + sin(angle) * radius
+
+            scattered.append(LooseCard(
+                id: cardId,
+                title: "Image \(index)",
+                icon: "photo",
+                position: CGPoint(x: cx, y: cy),
+                thumbnail: thumb
+            ))
+        }
+
+        withAnimation(.spring(response: 0.6, dampingFraction: 0.7)) {
+            images = newImages
+            looseCards = scattered
+            groups = []
+            canvasResult = nil
+            canvasPhase = .scattered
+        }
+
+        // Phase 2: Analyze with Claude
         isAnalyzing = true
         analysisError = nil
 
         do {
             let result = try await ClaudeService.shared.analyze(images: newImages)
-            withAnimation(.spring(response: 0.5, dampingFraction: 0.7)) {
+
+            // Phase 3: Organize into groups
+            withAnimation(.spring(response: 0.8, dampingFraction: 0.65)) {
                 canvasResult = result
+                canvasPhase = .organized
                 groups = result.groups.map { g in
                     let groupCards = result.cards.filter { $0.groupId == g.id }.map { c in
-                        CardData(id: c.id, title: c.label, icon: iconForCard(c.label))
+                        CardData(
+                            id: c.id,
+                            title: c.label,
+                            icon: iconForCard(c.label),
+                            thumbnail: thumbnails[c.id]
+                        )
                     }
                     return CardGroup(id: g.id, title: g.title, color: colorFromString(g.color), cards: groupCards)
                 }
@@ -133,6 +267,21 @@ struct ContentView: View {
         case "purple": return Color(red: 156/255, green: 39/255, blue: 176/255)
         default: return Color(red: 158/255, green: 158/255, blue: 158/255)
         }
+    }
+
+    private func generateThumbnail(from image: NSImage, size: CGFloat = 180) -> NSImage {
+        let targetSize = NSSize(width: size, height: size)
+        let thumbnail = NSImage(size: targetSize)
+        thumbnail.lockFocus()
+        let side = min(image.size.width, image.size.height)
+        let cropX = (image.size.width - side) / 2
+        let cropY = (image.size.height - side) / 2
+        let cropRect = NSRect(x: cropX, y: cropY, width: side, height: side)
+        image.draw(in: NSRect(origin: .zero, size: targetSize),
+                   from: cropRect,
+                   operation: .copy, fraction: 1.0)
+        thumbnail.unlockFocus()
+        return thumbnail
     }
 
     private func iconForCard(_ label: String) -> String {
@@ -221,10 +370,17 @@ struct WarpedGridView: View {
 
 // MARK: - Data Models
 
+enum CanvasPhase {
+    case empty
+    case scattered
+    case organized
+}
+
 struct CardData: Identifiable {
     let id: String
     let title: String
     let icon: String
+    var thumbnail: NSImage? = nil
 }
 
 struct CardGroup: Identifiable {
@@ -239,6 +395,7 @@ struct LooseCard: Identifiable {
     let title: String
     let icon: String
     var position: CGPoint
+    var thumbnail: NSImage? = nil
 }
 
 private let randomIcons = [
@@ -458,7 +615,7 @@ struct GroupedCardsView: View {
                         y: looseCard.position.y + drag.height
                     )
 
-                    LooseCardView(title: looseCard.title, icon: looseCard.icon)
+                    LooseCardView(title: looseCard.title, icon: looseCard.icon, thumbnail: looseCard.thumbnail)
                         .position(currentPos)
                         .zIndex(5)
                         .transition(.scale(scale: 0.3).combined(with: .opacity))
@@ -537,19 +694,29 @@ struct GroupCard: View {
     let groupColor: Color
 
     var body: some View {
-        VStack(spacing: 6) {
-            Image(systemName: card.icon)
-                .font(.system(size: 22, weight: .medium))
-                .foregroundStyle(groupColor)
-                .frame(width: 44, height: 44)
-                .background(
-                    RoundedRectangle(cornerRadius: 10)
-                        .fill(groupColor.opacity(0.1))
-                )
+        VStack(spacing: 4) {
+            if let thumbnail = card.thumbnail {
+                Image(nsImage: thumbnail)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: 70, height: 52)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+            } else {
+                Image(systemName: card.icon)
+                    .font(.system(size: 22, weight: .medium))
+                    .foregroundStyle(groupColor)
+                    .frame(width: 44, height: 44)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10)
+                            .fill(groupColor.opacity(0.1))
+                    )
+            }
 
             Text(card.title)
-                .font(.system(size: 11, weight: .semibold))
+                .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(.primary.opacity(0.8))
+                .lineLimit(2)
+                .multilineTextAlignment(.center)
         }
         .frame(width: 90, height: 90)
         .background(
@@ -565,21 +732,30 @@ struct GroupCard: View {
 struct LooseCardView: View {
     let title: String
     let icon: String
+    var thumbnail: NSImage? = nil
     private let looseColor = Color(red: 150/255, green: 150/255, blue: 150/255)
 
     var body: some View {
-        VStack(spacing: 6) {
-            Image(systemName: icon)
-                .font(.system(size: 22, weight: .medium))
-                .foregroundStyle(looseColor)
-                .frame(width: 44, height: 44)
-                .background(
-                    RoundedRectangle(cornerRadius: 10)
-                        .fill(looseColor.opacity(0.1))
-                )
+        VStack(spacing: 4) {
+            if let thumbnail = thumbnail {
+                Image(nsImage: thumbnail)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: 74, height: 56)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+            } else {
+                Image(systemName: icon)
+                    .font(.system(size: 22, weight: .medium))
+                    .foregroundStyle(looseColor)
+                    .frame(width: 44, height: 44)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10)
+                            .fill(looseColor.opacity(0.1))
+                    )
+            }
 
             Text(title)
-                .font(.system(size: 11, weight: .semibold))
+                .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(.primary.opacity(0.8))
                 .lineLimit(2)
                 .multilineTextAlignment(.center)
@@ -633,6 +809,17 @@ struct CardDetailView: View {
             }
 
             Spacer().frame(height: 18)
+
+            if let thumbnail = card.thumbnail {
+                Image(nsImage: thumbnail)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 160)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+
+                Spacer().frame(height: 12)
+            }
 
             // Title
             Text(card.title)
@@ -948,6 +1135,7 @@ struct AnimatedPromptBar: View {
 // MARK: - Glass Card
 
 struct GlassCard: View {
+    var onTapAdd: () -> Void
     private let cardWidth: CGFloat = 340
     private let cardHeight: CGFloat = 400
     private let cornerRadius: CGFloat = 20
@@ -961,7 +1149,7 @@ struct GlassCard: View {
                 .frame(width: cardWidth, height: cardHeight)
                 .offset(y: thickness)
 
-            VStack(spacing: 12) {
+            VStack(spacing: 16) {
                 Image(systemName: "sparkles")
                     .font(.system(size: 32, weight: .light))
                     .foregroundStyle(accentColor.opacity(0.85))
@@ -970,9 +1158,16 @@ struct GlassCard: View {
                     .font(.system(size: 22, weight: .semibold, design: .rounded))
                     .foregroundStyle(accentColor)
 
-                Text("Drop an image to begin")
+                Text("Drop images or tap + to begin")
                     .font(.system(size: 13, weight: .regular))
                     .foregroundStyle(accentColor.opacity(0.6))
+
+                Button(action: onTapAdd) {
+                    Image(systemName: "plus.circle.fill")
+                        .font(.system(size: 44, weight: .light))
+                        .foregroundStyle(.white.opacity(0.9))
+                }
+                .buttonStyle(.plain)
             }
             .frame(width: cardWidth, height: cardHeight)
             .background(
@@ -981,7 +1176,6 @@ struct GlassCard: View {
             )
             .glassEffect(.clear, in: .rect(cornerRadius: cornerRadius))
         }
-        //.shadow(color: accentColor.opacity(0.35), radius: 16, y: 8)
         .transition(.scale.combined(with: .opacity))
     }
 }
