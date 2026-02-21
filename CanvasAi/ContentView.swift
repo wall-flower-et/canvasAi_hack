@@ -5,6 +5,7 @@ struct ContentView: View {
     @State private var selectedItems: [PhotosPickerItem] = []
     @State private var images: [NSImage] = []
     @State private var promptExpanded: Bool = false
+    @State private var showPhotoPicker: Bool = false
 
     var body: some View {
         ZStack {
@@ -18,36 +19,26 @@ struct ContentView: View {
                 GlassCard()
             }
 
-            if images.count >= 2 {
-                OutputCard()
-                    .zIndex(1)
-            }
+            OutputCard()
+                .zIndex(1)
 
-            ImageCards(images: images)
+            GroupedCardsView(groups: sampleGroups)
                 .zIndex(2)
-                .allowsHitTesting(images.count > 0)
 
-            // Add button — bottom center
-            if !promptExpanded {
-                VStack {
-                    Spacer()
-                    PhotosPicker(selection: $selectedItems, matching: .images) {
-                        Image(systemName: "plus.circle.fill")
-                            .font(.system(size: 36))
-                            .foregroundStyle(Color(red: 222/255, green: 115/255, blue: 86/255))
-                            .shadow(color: .black.opacity(0.1), radius: 4, y: 2)
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.bottom, 30)
+            // Double-click anywhere opens photo picker
+            Color.clear
+                .contentShape(Rectangle())
+                .onTapGesture(count: 2) {
+                    showPhotoPicker = true
                 }
-                .zIndex(10)
-                .transition(.scale.combined(with: .opacity))
-            }
+                .zIndex(3)
+                .allowsHitTesting(!promptExpanded)
 
             // Floating prompt circle / bar — follows mouse, full screen overlay
             AnimatedPromptBar(isExpanded: $promptExpanded)
                 .zIndex(20)
         }
+        .photosPicker(isPresented: $showPhotoPicker, selection: $selectedItems, matching: .images)
         .onChange(of: selectedItems) {
             Task { await loadImages() }
         }
@@ -135,167 +126,343 @@ struct WarpedGridView: View {
     }
 }
 
-// MARK: - Connection Lines
+// MARK: - Data Models
 
-struct ConnectionLine {
-    let fromId: Int
-    let toId: Int
-    let label: String
-    let color: Color
+struct CardData: Identifiable {
+    let id: String
+    let title: String
+    let icon: String
 }
 
-// MARK: - Image Cards
+struct CardGroup: Identifiable {
+    let id: String
+    let title: String
+    let color: Color
+    let cards: [CardData]
+}
 
-struct ImageCards: View {
-    let images: [NSImage]
-    private let spreadRadius: CGFloat = 280
-    private let accentColor = Color(red: 222/255, green: 115/255, blue: 86/255)
+let sampleGroups: [CardGroup] = [
+    CardGroup(id: "travel", title: "Travel", color: Color(red: 76/255, green: 175/255, blue: 80/255), cards: [
+        CardData(id: "tokyo", title: "Tokyo", icon: "building.2"),
+        CardData(id: "kyoto", title: "Kyoto", icon: "leaf"),
+        CardData(id: "osaka", title: "Osaka", icon: "fork.knife"),
+    ]),
+    CardGroup(id: "food", title: "Food", color: Color(red: 222/255, green: 115/255, blue: 86/255), cards: [
+        CardData(id: "ramen", title: "Ramen", icon: "cup.and.saucer"),
+        CardData(id: "sushi", title: "Sushi", icon: "fish"),
+    ]),
+    CardGroup(id: "budget", title: "Budget", color: Color(red: 66/255, green: 133/255, blue: 244/255), cards: [
+        CardData(id: "flights", title: "Flights", icon: "airplane"),
+        CardData(id: "hotels", title: "Hotels", icon: "bed.double"),
+    ]),
+]
 
-    // Orbit center offset from screen center
-    private let orbitOffsetX: CGFloat = -80
-    private let orbitOffsetY: CGFloat = -30
+// MARK: - Grouped Cards View
 
-    @State private var selectedId: Int? = nil
-    @State private var savedOffsets: [Int: CGSize] = [:]   // persisted position
-    @State private var activeDrag: [Int: CGSize] = [:]     // live drag delta
+struct GroupedCardsView: View {
+    let groups: [CardGroup]
+    private let clusterRadius: CGFloat = 80
+    private let groupSpreadRadius: CGFloat = 260
 
-    // Auto-generate connections: consecutive + one cross
-    private var connections: [ConnectionLine] {
-        let n = images.count
-        guard n >= 2 else { return [] }
-        var lines: [ConnectionLine] = []
-        for i in 0..<(n - 1) {
-            lines.append(ConnectionLine(fromId: i, toId: i + 1, label: "link", color: accentColor))
-        }
-        if n >= 3 {
-            lines.append(ConnectionLine(fromId: 0, toId: n - 1, label: "cross", color: accentColor))
-        }
-        return lines
+    @State private var selectedCardId: String? = nil
+    @State private var savedOffsets: [String: CGSize] = [:]
+    @State private var activeDrag: [String: CGSize] = [:]
+    @State private var detailCard: CardData? = nil
+    @State private var detailGroup: CardGroup? = nil
+    @State private var glowingGroupId: String? = nil
+
+    private func fibonacciPos(index: Int, count: Int, centerX: CGFloat, centerY: CGFloat, radius: CGFloat) -> CGPoint {
+        let goldenAngle = CGFloat.pi * (3.0 - sqrt(5.0))
+        let t = count <= 1 ? 0.0 : CGFloat(index) / CGFloat(count - 1)
+        let phi = CGFloat(index) * goldenAngle
+        let cosTheta = 1.0 - 2.0 * t
+        let sinTheta = sqrt(max(0, 1.0 - cosTheta * cosTheta))
+        return CGPoint(
+            x: centerX + sinTheta * cos(phi) * radius,
+            y: centerY + sinTheta * sin(phi) * radius
+        )
     }
 
-    // Fibonacci sphere → 2D projection
-    // Golden angle distributes N points evenly on a sphere,
-    // then we project (x, y) to get a naturally-spaced 2D layout
-    private func cardPosition(_ i: Int, cx: CGFloat, cy: CGFloat) -> CGPoint {
-        let n = images.count
-        let goldenAngle = CGFloat.pi * (3.0 - sqrt(5.0)) // ~2.3999 rad
-        let ringCx = cx + orbitOffsetX
-        let ringCy = cy + orbitOffsetY
+    private func groupCenter(_ gi: Int, cx: CGFloat, cy: CGFloat) -> CGPoint {
+        let n = groups.count
+        let angle = (CGFloat.pi * 2 / CGFloat(n)) * CGFloat(gi) - .pi / 2
+        return CGPoint(x: cx + cos(angle) * groupSpreadRadius,
+                       y: cy + sin(angle) * groupSpreadRadius)
+    }
 
-        // Fibonacci sphere: y goes from -1 to 1, golden angle increments azimuth
-        let t = n <= 1 ? 0.0 : CGFloat(i) / CGFloat(n - 1)
-        let phi = CGFloat(i) * goldenAngle
-        let cosTheta = 1.0 - 2.0 * t          // ranges from 1 to -1
-        let sinTheta = sqrt(1.0 - cosTheta * cosTheta)
-
-        // Project sphere (x, y) → screen (x, y), z becomes depth/scale
-        let sx = sinTheta * cos(phi)
-        let sy = sinTheta * sin(phi)
-
-        let saved = savedOffsets[i] ?? .zero
-        let drag = activeDrag[i] ?? .zero
-        return CGPoint(
-            x: ringCx + sx * spreadRadius + saved.width + drag.width,
-            y: ringCy + sy * spreadRadius + saved.height + drag.height
-        )
+    private func cardPosition(groupIndex gi: Int, cardIndex ci: Int, cx: CGFloat, cy: CGFloat) -> CGPoint {
+        let gc = groupCenter(gi, cx: cx, cy: cy)
+        let count = groups[gi].cards.count
+        let base = fibonacciPos(index: ci, count: count, centerX: gc.x, centerY: gc.y, radius: clusterRadius)
+        let cardId = groups[gi].cards[ci].id
+        let saved = savedOffsets[cardId] ?? .zero
+        let drag = activeDrag[cardId] ?? .zero
+        return CGPoint(x: base.x + saved.width + drag.width,
+                       y: base.y + saved.height + drag.height)
     }
 
     var body: some View {
         GeometryReader { geo in
             let cx = geo.size.width / 2
             let cy = geo.size.height / 2
-            let n = images.count
 
             ZStack {
-                // Connection lines (behind cards)
+                // Canvas: group circles + connection lines + midpoint dots
                 Canvas { context, _ in
-                    for conn in connections {
-                        let from = cardPosition(conn.fromId, cx: cx, cy: cy)
-                        let to = cardPosition(conn.toId, cx: cx, cy: cy)
+                    for gi in 0..<groups.count {
+                        let group = groups[gi]
+                        let n = group.cards.count
 
-                        // Line
-                        var linePath = Path()
-                        linePath.move(to: from)
-                        linePath.addLine(to: to)
-                        context.stroke(linePath, with: .color(conn.color.opacity(0.25)), lineWidth: 1)
+                        var positions: [CGPoint] = []
+                        for ci in 0..<n {
+                            positions.append(cardPosition(groupIndex: gi, cardIndex: ci, cx: cx, cy: cy))
+                        }
 
-                        // Diamond at midpoint
-                        let mid = CGPoint(x: (from.x + to.x) / 2, y: (from.y + to.y) / 2)
-                        let d: CGFloat = 5
-                        var diamond = Path()
-                        diamond.move(to: CGPoint(x: mid.x, y: mid.y - d))
-                        diamond.addLine(to: CGPoint(x: mid.x + d, y: mid.y))
-                        diamond.addLine(to: CGPoint(x: mid.x, y: mid.y + d))
-                        diamond.addLine(to: CGPoint(x: mid.x - d, y: mid.y))
-                        diamond.closeSubpath()
-                        context.fill(diamond, with: .color(conn.color.opacity(0.35)))
+                        // Group encompassing circle
+                        if !positions.isEmpty {
+                            let avgX = positions.map(\.x).reduce(0, +) / CGFloat(n)
+                            let avgY = positions.map(\.y).reduce(0, +) / CGFloat(n)
+                            let maxDist = positions.map { hypot($0.x - avgX, $0.y - avgY) }.max() ?? 0
+                            let circleR = maxDist + 70
+
+                            let circleRect = CGRect(x: avgX - circleR, y: avgY - circleR, width: circleR * 2, height: circleR * 2)
+                            let circlePath = Path(ellipseIn: circleRect)
+
+                            let isGlowing = glowingGroupId == group.id
+                            let fillOpacity: CGFloat = isGlowing ? 0.15 : 0.05
+                            let strokeOpacity: CGFloat = isGlowing ? 0.6 : 0.3
+
+                            context.fill(circlePath, with: .color(group.color.opacity(fillOpacity)))
+                            let dashed = circlePath.strokedPath(StrokeStyle(lineWidth: isGlowing ? 1.5 : 1, dash: [6, 4]))
+                            context.fill(dashed, with: .color(group.color.opacity(strokeOpacity)))
+                        }
+
+                        // Intra-group connection lines
+                        if n >= 2 {
+                            for ci in 0..<(n - 1) {
+                                let from = positions[ci]
+                                let to = positions[ci + 1]
+
+                                var linePath = Path()
+                                linePath.move(to: from)
+                                linePath.addLine(to: to)
+                                context.stroke(linePath, with: .color(group.color.opacity(0.2)), lineWidth: 0.5)
+
+                                let mid = CGPoint(x: (from.x + to.x) / 2, y: (from.y + to.y) / 2)
+                                let dotRect = CGRect(x: mid.x - 2, y: mid.y - 2, width: 4, height: 4)
+                                context.fill(Path(ellipseIn: dotRect), with: .color(group.color))
+                            }
+
+                            if n >= 3 {
+                                let from = positions[n - 1]
+                                let to = positions[0]
+                                var linePath = Path()
+                                linePath.move(to: from)
+                                linePath.addLine(to: to)
+                                context.stroke(linePath, with: .color(group.color.opacity(0.2)), lineWidth: 0.5)
+
+                                let mid = CGPoint(x: (from.x + to.x) / 2, y: (from.y + to.y) / 2)
+                                let dotRect = CGRect(x: mid.x - 2, y: mid.y - 2, width: 4, height: 4)
+                                context.fill(Path(ellipseIn: dotRect), with: .color(group.color))
+                            }
+                        }
                     }
                 }
 
                 // Cards
-                ForEach(0..<n, id: \.self) { i in
-                    let pos = cardPosition(i, cx: cx, cy: cy)
-                    let isSelected = selectedId == i
-                    let hasFocus = selectedId != nil
+                ForEach(0..<groups.count, id: \.self) { gi in
+                    let group = groups[gi]
+                    ForEach(0..<group.cards.count, id: \.self) { ci in
+                        let card = group.cards[ci]
+                        let pos = cardPosition(groupIndex: gi, cardIndex: ci, cx: cx, cy: cy)
+                        let isSelected = selectedCardId == card.id
+                        let hasFocus = selectedCardId != nil
 
-                    ImageCard(image: images[i])
-                        .scaleEffect(isSelected ? 1.15 : (hasFocus ? 0.9 : 1.0))
-                        .opacity(isSelected ? 1.0 : (hasFocus ? 0.3 : 1.0))
-                        .shadow(color: isSelected ? .black.opacity(0.2) : .clear, radius: 20, y: 10)
-                        .zIndex(isSelected ? 10 : 0)
-                        .position(x: pos.x, y: pos.y)
-                        .transition(.scale.combined(with: .opacity))
-                        .gesture(
-                            DragGesture()
-                                .onChanged { value in
-                                    selectedId = i
-                                    activeDrag[i] = value.translation
+                        GroupCard(card: card, groupColor: group.color)
+                            .scaleEffect(isSelected ? 1.15 : (hasFocus ? 0.9 : 1.0))
+                            .opacity(isSelected ? 1.0 : (hasFocus ? 0.4 : 1.0))
+                            .shadow(color: isSelected ? .black.opacity(0.2) : .clear, radius: 16, y: 8)
+                            .zIndex(isSelected ? 10 : 0)
+                            .position(x: pos.x, y: pos.y)
+                            .gesture(
+                                DragGesture()
+                                    .onChanged { value in
+                                        selectedCardId = card.id
+                                        activeDrag[card.id] = value.translation
+                                    }
+                                    .onEnded { value in
+                                        let prev = savedOffsets[card.id] ?? .zero
+                                        savedOffsets[card.id] = CGSize(
+                                            width: prev.width + value.translation.width,
+                                            height: prev.height + value.translation.height
+                                        )
+                                        activeDrag[card.id] = .zero
+                                        withAnimation(.spring(response: 0.3)) {
+                                            selectedCardId = nil
+                                        }
+                                    }
+                            )
+                            .onTapGesture {
+                                withAnimation(.spring(response: 0.35)) {
+                                    selectedCardId = card.id
+                                    detailCard = card
+                                    detailGroup = group
+                                    glowingGroupId = group.id
                                 }
-                                .onEnded { value in
-                                    // Accumulate into saved offset
-                                    let prev = savedOffsets[i] ?? .zero
-                                    savedOffsets[i] = CGSize(
-                                        width: prev.width + value.translation.width,
-                                        height: prev.height + value.translation.height
-                                    )
-                                    activeDrag[i] = .zero
-                                    withAnimation(.spring(response: 0.3)) {
-                                        selectedId = nil
+                                // Fade glow after a moment
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                    withAnimation(.easeOut(duration: 0.6)) {
+                                        glowingGroupId = nil
                                     }
                                 }
-                        )
+                            }
+                            .animation(.spring(response: 0.35), value: selectedCardId)
+                    }
+                }
+
+                // Card Detail Overlay
+                if let card = detailCard, let group = detailGroup {
+                    // Dimmed backdrop
+                    Color.black.opacity(0.2)
+                        .ignoresSafeArea()
                         .onTapGesture {
-                            withAnimation(.spring(response: 0.35)) {
-                                selectedId = selectedId == i ? nil : i
+                            withAnimation(.spring(response: 0.3)) {
+                                detailCard = nil
+                                detailGroup = nil
+                                selectedCardId = nil
                             }
                         }
-                        .animation(.spring(response: 0.35), value: selectedId)
+                        .zIndex(50)
+
+                    CardDetailView(card: card, group: group) {
+                        withAnimation(.spring(response: 0.3)) {
+                            detailCard = nil
+                            detailGroup = nil
+                            selectedCardId = nil
+                        }
+                    }
+                    .zIndex(51)
                 }
             }
         }
     }
 }
 
-struct ImageCard: View {
-    let image: NSImage
+// MARK: - Group Card
+
+struct GroupCard: View {
+    let card: CardData
+    let groupColor: Color
 
     var body: some View {
-        VStack(spacing: 8) {
-            Image(nsImage: image)
-                .resizable()
-                .aspectRatio(contentMode: .fill)
-                .frame(width: 90, height: 80)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
+        VStack(spacing: 6) {
+            Image(systemName: card.icon)
+                .font(.system(size: 22, weight: .medium))
+                .foregroundStyle(groupColor)
+                .frame(width: 44, height: 44)
+                .background(
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(groupColor.opacity(0.1))
+                )
 
-            Text("Image")
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(.secondary)
+            Text(card.title)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.primary.opacity(0.8))
         }
-        .frame(width: 110, height: 130)
+        .frame(width: 90, height: 90)
         .background(
-            RoundedRectangle(cornerRadius: 12)
+            RoundedRectangle(cornerRadius: 14)
                 .fill(.white)
-                .shadow(color: .black.opacity(0.1), radius: 8, y: 4)
+                .shadow(color: .black.opacity(0.08), radius: 8, y: 3)
+        )
+    }
+}
+
+// MARK: - Card Detail View
+
+struct CardDetailView: View {
+    let card: CardData
+    let group: CardGroup
+    let onClose: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Top bar: badge + close
+            HStack {
+                Text(group.title)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .textCase(.uppercase)
+                    .tracking(1)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(Capsule().fill(group.color))
+
+                Spacer()
+
+                Button(action: onClose) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 28, height: 28)
+                        .background(Circle().fill(Color.black.opacity(0.05)))
+                }
+                .buttonStyle(.plain)
+            }
+
+            Spacer().frame(height: 18)
+
+            // Title
+            Text(card.title)
+                .font(.system(size: 24, weight: .regular, design: .serif))
+                .foregroundStyle(.primary)
+
+            Spacer().frame(height: 14)
+
+            // Body placeholder
+            Text("Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris.")
+                .font(.system(size: 13))
+                .foregroundStyle(.secondary)
+                .lineSpacing(4)
+
+            Spacer().frame(height: 20)
+
+            // Connections section
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Connections")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .textCase(.uppercase)
+                    .tracking(0.8)
+
+                ForEach(group.cards.filter { $0.id != card.id }) { sibling in
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(group.color)
+                            .frame(width: 6, height: 6)
+
+                        Image(systemName: sibling.icon)
+                            .font(.system(size: 12))
+                            .foregroundStyle(group.color)
+
+                        Text(sibling.title)
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(.primary.opacity(0.8))
+                    }
+                }
+            }
+        }
+        .padding(24)
+        .frame(width: 300)
+        .background(
+            RoundedRectangle(cornerRadius: 20)
+                .fill(.white)
+                .shadow(color: .black.opacity(0.15), radius: 24, y: 12)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 20))
+        .transition(
+            .scale(scale: 0.9, anchor: .center)
+            .combined(with: .opacity)
         )
     }
 }
@@ -417,13 +584,14 @@ struct AnimatedPromptBar: View {
     @Binding var isExpanded: Bool
     @State private var phase: PromptPhase = .circle
     @State private var mousePos: CGPoint = .zero
+    @State private var anchorPos: CGPoint = .zero  // where the bar opens
     @State private var rollOffset: CGFloat = 0
     @State private var rollRotation: Double = 0
-    @State private var barWidth: CGFloat = 44
+    @State private var barWidth: CGFloat = 40
     @State private var promptText: String = ""
     @FocusState private var isFocused: Bool
 
-    private let circleSize: CGFloat = 44
+    private let circleSize: CGFloat = 40
     private let expandedWidth: CGFloat = 400
     private let accentColor = Color(red: 222/255, green: 115/255, blue: 86/255)
 
@@ -436,12 +604,9 @@ struct AnimatedPromptBar: View {
 
     var body: some View {
         GeometryReader { geo in
-            let screenCx = geo.size.width / 2
-            let anchorY = geo.size.height - 50
-
             // Where the shape should be
-            let posX: CGFloat = phase == .circle ? mousePos.x : screenCx + rollOffset
-            let posY: CGFloat = phase == .circle ? mousePos.y : anchorY
+            let posX: CGFloat = phase == .circle ? mousePos.x : anchorPos.x + rollOffset
+            let posY: CGFloat = phase == .circle ? mousePos.y : anchorPos.y
 
             ZStack {
                 HStack(spacing: 0) {
@@ -488,56 +653,56 @@ struct AnimatedPromptBar: View {
                     }
                 }
             }
-            .onTapGesture(count: 2) {
+            .contextMenu {
                 if phase == .expanded || phase == .expanding {
-                    collapseAnimation(screenCx: screenCx, anchorY: anchorY)
+                    Button("Close prompt") {
+                        collapseAnimation()
+                    }
                 }
             }
-            .onTapGesture(count: 1) {
-                if phase == .circle {
-                    expandAnimation(screenCx: screenCx, anchorY: anchorY)
-                }
+            .gesture(
+                TapGesture(count: 1)
+                    .onEnded {
+                        if phase == .circle {
+                            expandAnimation()
+                        }
+                    }
+            )
+        }
+    }
+
+    private func expandAnimation() {
+        // Lock the anchor at current mouse position
+        anchorPos = CGPoint(x: mousePos.x - 80, y: mousePos.y)
+        isExpanded = true
+        phase = .rolling
+
+        // Phase 1: Roll to the right from click spot
+        withAnimation(.easeIn(duration: 0.45)) {
+            rollOffset = 80
+            rollRotation = 360
+        }
+
+        // Phase 2: Stop rolling, expand width in place
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+            phase = .expanding
+            rollRotation = 0
+            withAnimation(.spring(response: 0.4, dampingFraction: 0.75)) {
+                rollOffset = 0
+                barWidth = expandedWidth
+            }
+        }
+
+        // Phase 3: Show text field
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.85) {
+            phase = .expanded
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                isFocused = true
             }
         }
     }
 
-    private func expandAnimation(screenCx: CGFloat, anchorY: CGFloat) {
-        // Snap to bottom center to start rolling
-        withAnimation(.easeOut(duration: 0.25)) {
-            mousePos = CGPoint(x: screenCx - 160, y: anchorY)
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-            isExpanded = true
-            phase = .rolling
-
-            // Phase 1: Roll to the right
-            withAnimation(.easeIn(duration: 0.45)) {
-                rollOffset = 160
-                rollRotation = 360
-            }
-
-            // Phase 2: Stop rolling, expand width
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
-                phase = .expanding
-                rollRotation = 0
-                withAnimation(.spring(response: 0.4, dampingFraction: 0.75)) {
-                    rollOffset = 0
-                    barWidth = expandedWidth
-                }
-            }
-
-            // Phase 3: Show text field
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.85) {
-                phase = .expanded
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                    isFocused = true
-                }
-            }
-        }
-    }
-
-    private func collapseAnimation(screenCx: CGFloat, anchorY: CGFloat) {
+    private func collapseAnimation() {
         isFocused = false
         promptText = ""
 
@@ -548,11 +713,10 @@ struct AnimatedPromptBar: View {
             isExpanded = false
         }
 
-        // Reset position to center so it picks up mouse again
+        // Reset offsets so it picks up mouse again
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
             rollOffset = 0
             rollRotation = 0
-            mousePos = CGPoint(x: screenCx, y: anchorY)
         }
     }
 }
