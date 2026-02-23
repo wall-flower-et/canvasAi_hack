@@ -30,6 +30,9 @@ struct ContentView: View {
             }
 
             if let result = canvasResult {
+                ConnectionLinesView(groups: groups)
+                    .zIndex(0.5)
+
                 OutputCard(result: result)
                     .zIndex(1)
             }
@@ -381,6 +384,7 @@ struct CardData: Identifiable {
     let title: String
     let icon: String
     var thumbnail: NSImage? = nil
+    var isActive: Bool = true
 }
 
 struct CardGroup: Identifiable {
@@ -475,6 +479,25 @@ struct GroupedCardsView: View {
         return nil
     }
 
+    private func toggleCardActive(groupIndex gi: Int, cardIndex ci: Int) {
+        withAnimation(.spring(response: 0.3)) {
+            groups[gi].cards[ci].isActive.toggle()
+        }
+    }
+
+    private func deleteCard(groupIndex gi: Int, cardIndex ci: Int) {
+        withAnimation(.spring(response: 0.4, dampingFraction: 0.7)) {
+            groups[gi].cards.remove(at: ci)
+        }
+    }
+
+    private func deleteLooseCard(id: String) {
+        withAnimation(.spring(response: 0.4, dampingFraction: 0.7)) {
+            looseCards.removeAll { $0.id == id }
+            looseCardDrags.removeValue(forKey: id)
+        }
+    }
+
     private func addLooseCardToGroup(looseCard: LooseCard, groupIndex gi: Int) {
         let newCard = CardData(id: looseCard.id, title: looseCard.title, icon: looseCard.icon)
         withAnimation(.spring(response: 0.5, dampingFraction: 0.7)) {
@@ -565,10 +588,27 @@ struct GroupedCardsView: View {
 
                         GroupCard(card: card, groupColor: group.color)
                             .scaleEffect(isSelected ? 1.15 : (hasFocus ? 0.9 : 1.0))
-                            .opacity(isSelected ? 1.0 : (hasFocus ? 0.4 : 1.0))
+                            .opacity(card.isActive
+                                     ? (isSelected ? 1.0 : (hasFocus ? 0.4 : 1.0))
+                                     : 0.35)
+                            .saturation(card.isActive ? 1.0 : 0.0)
                             .shadow(color: isSelected ? .black.opacity(0.2) : .clear, radius: 16, y: 8)
                             .zIndex(isSelected ? 10 : 0)
                             .position(x: pos.x, y: pos.y)
+                            .contextMenu {
+                                Button {
+                                    toggleCardActive(groupIndex: gi, cardIndex: ci)
+                                } label: {
+                                    Label(card.isActive ? "Deactivate" : "Activate",
+                                          systemImage: card.isActive ? "eye.slash" : "eye")
+                                }
+                                Divider()
+                                Button(role: .destructive) {
+                                    deleteCard(groupIndex: gi, cardIndex: ci)
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                            }
                             .gesture(
                                 DragGesture()
                                     .onChanged { value in
@@ -619,6 +659,13 @@ struct GroupedCardsView: View {
                         .position(currentPos)
                         .zIndex(5)
                         .transition(.scale(scale: 0.3).combined(with: .opacity))
+                        .contextMenu {
+                            Button(role: .destructive) {
+                                deleteLooseCard(id: looseCard.id)
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
+                        }
                         .gesture(
                             DragGesture()
                                 .onChanged { value in
@@ -875,6 +922,75 @@ struct CardDetailView: View {
     }
 }
 
+// MARK: - Connection Lines (Groups → Output)
+
+struct ConnectionLinesView: View {
+    let groups: [CardGroup]
+    private let groupSpreadRadius: CGFloat = 260
+    private let accentColor = Color(red: 222/255, green: 115/255, blue: 86/255)
+
+    var body: some View {
+        GeometryReader { geo in
+            let cx = geo.size.width / 2
+            let cy = geo.size.height / 2
+            let n = groups.count
+
+            Canvas { context, _ in
+                guard n > 0 else { return }
+
+                for gi in 0..<n {
+                    let angle = (CGFloat.pi * 2 / CGFloat(n)) * CGFloat(gi) - .pi / 2
+                    let groupCenter = CGPoint(
+                        x: cx + cos(angle) * groupSpreadRadius,
+                        y: cy + sin(angle) * groupSpreadRadius
+                    )
+
+                    // Curved bezier from group center to canvas center
+                    let mid = CGPoint(
+                        x: (groupCenter.x + cx) / 2,
+                        y: (groupCenter.y + cy) / 2
+                    )
+                    // Perpendicular offset for curve
+                    let dx = cx - groupCenter.x
+                    let dy = cy - groupCenter.y
+                    let dist = hypot(dx, dy)
+                    let curvature: CGFloat = 0.15
+                    let perpX = -dy / dist * dist * curvature
+                    let perpY = dx / dist * dist * curvature
+                    let ctrl = CGPoint(x: mid.x + perpX, y: mid.y + perpY)
+
+                    var path = Path()
+                    path.move(to: groupCenter)
+                    path.addQuadCurve(to: CGPoint(x: cx, y: cy), control: ctrl)
+
+                    // Dashed line
+                    let dashed = path.strokedPath(StrokeStyle(lineWidth: 1, dash: [6, 4]))
+                    context.fill(dashed, with: .color(accentColor.opacity(0.25)))
+
+                    // Node dot at group end
+                    let dotSize: CGFloat = 6
+                    let groupDot = CGRect(
+                        x: groupCenter.x - dotSize / 2,
+                        y: groupCenter.y - dotSize / 2,
+                        width: dotSize, height: dotSize
+                    )
+                    context.fill(Path(ellipseIn: groupDot), with: .color(accentColor.opacity(0.5)))
+
+                    // Node dot at output center
+                    let centerDot = CGRect(
+                        x: cx - dotSize / 2,
+                        y: cy - dotSize / 2,
+                        width: dotSize, height: dotSize
+                    )
+                    context.fill(Path(ellipseIn: centerDot), with: .color(accentColor.opacity(0.5)))
+                }
+            }
+        }
+        .allowsHitTesting(false)
+        .transition(.opacity)
+    }
+}
+
 // MARK: - Output Card
 
 struct OutputCard: View {
@@ -948,10 +1064,10 @@ struct OutputCard: View {
         .frame(width: cardWidth)
         .background(
             RoundedRectangle(cornerRadius: cornerRadius)
-                .fill(accentColor)
+                .fill(accentColor.opacity(0.6))
                 .shadow(color: accentColor.opacity(0.35), radius: 16, y: 8)
         )
-        .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
+        .glassEffect(.clear, in: .rect(cornerRadius: cornerRadius))
         .transition(
             .scale(scale: 0.9)
             .combined(with: .opacity)
